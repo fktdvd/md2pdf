@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# md2pdf — markdown -> A4 PDF (pandoc + headless Chrome)
+set -euo pipefail
+
+PROG=$(basename "$0")
+CHROME=${MD2PDF_CHROME:-"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}
+PANDOC=${MD2PDF_PANDOC:-pandoc}
+PRINT=0
+OUT=""
+KEEP=0
+
+# a szkript valódi helye (symlinket is feloldva), hogy a stilus.css-t megtalálja
+self=${BASH_SOURCE[0]}
+while [ -L "$self" ]; do
+  d=$(cd -P "$(dirname "$self")" && pwd)
+  self=$(readlink "$self")
+  case $self in /*) ;; *) self=$d/$self ;; esac
+done
+SELFDIR=$(cd -P "$(dirname "$self")" && pwd)
+CSS=${MD2PDF_CSS:-$SELFDIR/stilus.css}
+
+usage() {
+  cat <<'EOF'
+md2pdf — markdown -> A4 PDF (pandoc + headless Chrome)
+
+használat:
+  md2pdf jegyzet.md             -> jegyzet.pdf ugyanabban a mappában
+  md2pdf a.md b.md c.md         -> a.pdf, b.pdf, c.pdf
+  md2pdf -o nev.pdf jegyzet.md
+  md2pdf -p jegyzet.md          -> PDF + azonnali nyomtatás (alap nyomtató)
+
+opciók:
+  -o FÁJL   kimeneti fájlnév (csak egy bemenetnél)
+  -p        nyomtatás is az alapértelmezett nyomtatóra (lp)
+  -k        a köztes HTML megtartása (hibakereséshez)
+  -h        ez a súgó
+EOF
+}
+
+while getopts ":o:pkh" opt; do
+  case $opt in
+    o) OUT=$OPTARG ;;
+    p) PRINT=1 ;;
+    k) KEEP=1 ;;
+    h) usage; exit 0 ;;
+    :) echo "$PROG: a -$OPTARG kapcsolóhoz kell érték" >&2; exit 2 ;;
+    *) echo "$PROG: ismeretlen kapcsoló: -$OPTARG" >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+[ $# -ge 1 ] || { usage; exit 2; }
+if [ -n "$OUT" ] && [ $# -gt 1 ]; then
+  echo "$PROG: a -o csak egy bemeneti fájllal használható" >&2; exit 2
+fi
+
+command -v "$PANDOC" >/dev/null 2>&1 || {
+  echo "$PROG: nincs pandoc a PATH-ban." >&2
+  echo "  telepítés: https://github.com/jgm/pandoc/releases (előre fordított mac bináris)" >&2
+  exit 1
+}
+[ -x "$CHROME" ] || { echo "$PROG: nem találom a Chrome-ot: $CHROME" >&2; exit 1; }
+[ -r "$CSS" ] || { echo "$PROG: hiányzik a stíluslap: $CSS" >&2; exit 1; }
+
+OK=0
+FAIL=0
+
+for src in "$@"; do
+  case "$src" in -*) echo "$PROG: ismeretlen opció: $src" >&2; exit 2 ;; esac
+  if [ ! -f "$src" ]; then
+    echo "$PROG: nincs ilyen fájl: $src" >&2; FAIL=$((FAIL + 1)); continue
+  fi
+
+  if [ -n "$OUT" ]; then dst=$OUT; else dst=${src%.*}.pdf; fi
+  dst_abs="$(cd "$(dirname "$dst")" && pwd)/$(basename "$dst")"
+
+  tmpd=$(mktemp -d "${TMPDIR:-/tmp}/md2pdf.XXXXXX")
+  html=$tmpd/doc.html
+
+  # lists_without_preceding_blankline: üres sor nélkül kezdett felsorolások is listává válnak
+  if ! "$PANDOC" -f markdown+lists_without_preceding_blankline \
+        -s --embed-resources --css="$CSS" \
+        --metadata title="$(basename "$dst_abs" .pdf)" \
+        -o "$html" "$src"; then
+    echo "$PROG: pandoc hiba: $src" >&2; FAIL=$((FAIL + 1)); rm -rf "$tmpd"; continue
+  fi
+
+  if ! "$CHROME" --headless=new --disable-gpu --no-pdf-header-footer \
+        --print-to-pdf="$dst_abs" "file://$html" >/dev/null 2>&1; then
+    echo "$PROG: PDF írási hiba: $src" >&2; FAIL=$((FAIL + 1)); rm -rf "$tmpd"; continue
+  fi
+
+  [ "$KEEP" = 1 ] && cp "$html" "${dst%.pdf}.html"
+  rm -rf "$tmpd"
+
+  if [ ! -s "$dst_abs" ]; then
+    echo "$PROG: üres PDF készült: $dst" >&2; FAIL=$((FAIL + 1)); continue
+  fi
+
+  if [ "$PRINT" = 1 ]; then
+    if lp "$dst_abs" >/dev/null; then
+      echo "kész + nyomtatásba küldve: $dst"
+    else
+      echo "$PROG: nyomtatási hiba: $dst" >&2; FAIL=$((FAIL + 1)); continue
+    fi
+  else
+    echo "kész: $dst ($(( $(stat -f%z "$dst_abs") / 1024 )) KB)"
+  fi
+  OK=$((OK + 1))
+done
+
+[ "$FAIL" -eq 0 ] || exit 1
